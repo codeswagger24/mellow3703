@@ -1,0 +1,1162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milky Way - drag to grab, scroll to zoom</title>
+<!--
+  Interactive spiral galaxy (Milky Way / Andromeda style).
+
+  Controls
+    Left-click + drag : grab the galaxy and tilt / rotate it (keeps drifting with inertia)
+    Mouse wheel       : zoom   (touching the mouse during the opening skips it)
+    Space             : pause / resume spin
+    R                 : reset view
+    T                 : show / hide the text
+    Y                 : show / hide "YOU ARE HERE"
+    Z                 : show / hide the Taurus constellation
+    M                 : mute / unmute the music
+    Esc / Q           : quit (fades to black - reload the page to start again)
+
+  Optional: put a music.mp3 / music.ogg / music.wav next to this file and it plays
+  instead of the built-in ambient pad. No build step, no dependencies - open it in a
+  browser, or upload it straight to GitHub (GitHub Pages serves it as-is).
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block;
+    width: auto; height: auto;
+    max-width: 100vw; max-height: 100vh;
+    touch-action: none;
+    cursor: grab;
+  }
+  canvas.grabbing { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="sky" width="1000" height="800"></canvas>
+<script>
+"use strict";
+
+// ----------------------------------------------------------------------------------------
+// Settings
+// ----------------------------------------------------------------------------------------
+const W = 1000, H = 800;
+const RS = 0.25;                       // galaxy rendered at this fraction of screen size, then scaled up
+const BW = (W * RS) | 0, BH = (H * RS) | 0;
+const SW = BW >> 1, SH = BH >> 1;
+const R_PX = 470.0;                    // galaxy radius in screen pixels at zoom 1
+const QUALITY = 1.0;                   // 0.5 = faster / sparser, 2.0 = denser
+const MUSIC_VOLUME = 0.25;
+const SPIN = 0.07;                     // spin speed (rad/s)
+const PITCH = 2.7;                     // how tightly the spiral arms wind
+const SHARP = 7.0;                     // brightness of the crisp full-resolution star points
+const GAIN = 0.50;                     // overall brightness
+const INTRO = 9.0;                     // seconds for the opening zoom-in (0 = skip it)
+const DUST = 0.09;                     // darkness of the dust lanes
+const TAU = Math.PI * 2;
+const q = n => (n * QUALITY) | 0;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+// ----------------------------------------------------------------------------------------
+// Random numbers (seeded, so the galaxy is identical every load)
+// ----------------------------------------------------------------------------------------
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = makeRng(11);
+let gaussSpare = null;
+function randn() {                       // standard normal (Box-Muller)
+  if (gaussSpare !== null) { const v = gaussSpare; gaussSpare = null; return v; }
+  let u, v, s;
+  do { u = rng() * 2 - 1; v = rng() * 2 - 1; s = u * u + v * v; } while (s >= 1 || s === 0);
+  const m = Math.sqrt(-2 * Math.log(s) / s);
+  gaussSpare = v * m;
+  return u * m;
+}
+const rexp = scale => -scale * Math.log(1 - rng());   // numpy: rng.exponential(scale)
+const uni = (a, b) => a + (b - a) * rng();
+const coin = () => rng() < 0.5 ? 0 : 1;
+
+// ----------------------------------------------------------------------------------------
+// Build the galaxy (all positions in galaxy units: disk radius = 1)
+// ----------------------------------------------------------------------------------------
+let R, TH, Z, COL, DR, DTH, DZ, DW, OM, DOM, N, SHARP_RGB;
+let fx, fy;                              // projected screen coordinates, length N
+
+function build() {
+  const parts = [];                      // each: {r, th, z, col}  (col = 3 floats per star)
+
+  // --- spiral disk ---
+  {
+    let n = q(150000);
+    const keep = [];
+    for (let i = 0; i < n; i++) { const v = rexp(0.42); if (v < 1.0) keep.push(v); }
+    n = keep.length;
+    const r = new Float32Array(n), th = new Float32Array(n), z = new Float32Array(n);
+    const col = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const ri = keep[i];
+      const arm = coin();
+      const inArm = rng() < 0.80;
+      const thArm = arm * Math.PI + PITCH * Math.log(ri / 0.05 + 1.0) + randn() * (0.15 + 0.09 * ri);
+      const thFlat = rng() * TAU;
+      th[i] = inArm ? thArm : thFlat;
+      z[i] = randn() * 0.010 * (1 + 2.0 * ri);
+
+      const mix = clamp(ri / 0.55, 0, 1) * (inArm ? 1.0 : 0.45);
+      let cr = 255 * (1 - mix) + 160 * mix;
+      let cg = 214 * (1 - mix) + 188 * mix;
+      let cb = 160 * (1 - mix) + 255 * mix;
+      const hraw = rng();
+      const hii = inArm && hraw < 0.035 && ri > 0.25;      // pinkish star-forming knots
+      if (hii) { cr = 255; cg = 130; cb = 165; }
+      let b = uni(0.25, 1.0);
+      b = b * b * (inArm ? 2.6 : 1.0) * (hii ? 3.0 : 1.0);
+      const k = 0.042 * b / 255;
+      r[i] = ri; col[i * 3] = cr * k; col[i * 3 + 1] = cg * k; col[i * 3 + 2] = cb * k;
+    }
+    parts.push({ r, th, z, col });
+  }
+
+  // --- star-forming clumps: glowing knots of pink gas and young blue-white stars ---
+  {
+    const nc = q(340);
+    const crA = new Float64Array(nc), cthA = new Float64Array(nc);
+    for (let i = 0; i < nc; i++) {
+      const c = 0.18 + 0.68 * Math.pow(rng(), 0.8);
+      crA[i] = c;
+      cthA[i] = coin() * Math.PI + PITCH * Math.log(c / 0.05 + 1.0) + randn() * 0.07;
+    }
+    const per = 70, k = nc * per;
+    const r = new Float32Array(k), th = new Float32Array(k), z = new Float32Array(k);
+    const col = new Float32Array(k * 3);
+    for (let i = 0; i < k; i++) {
+      const ci = (i / per) | 0;
+      const x = crA[ci] * Math.cos(cthA[ci]) + randn() * 0.016;
+      const y = crA[ci] * Math.sin(cthA[ci]) + randn() * 0.016;
+      r[i] = Math.hypot(x, y); th[i] = Math.atan2(y, x); z[i] = randn() * 0.006;
+      const young = rng() < 0.42;
+      const cr = young ? 185 : 255, cg = young ? 205 : 120, cb = young ? 255 : 170;
+      let b = rng(); b = b * b * (young ? 0.12 : 0.13);
+      col[i * 3] = cr / 255 * b; col[i * 3 + 1] = cg / 255 * b; col[i * 3 + 2] = cb / 255 * b;
+    }
+    parts.push({ r, th, z, col });
+  }
+
+  // --- faint stellar bar through the middle ---
+  {
+    const n = q(15000);
+    const r = new Float32Array(n), th = new Float32Array(n), z = new Float32Array(n);
+    const col = new Float32Array(n * 3);
+    const ba = 0.6, ca = Math.cos(ba), sa = Math.sin(ba);
+    for (let i = 0; i < n; i++) {
+      const bx = randn() * 0.15, by = randn() * 0.045;
+      const x = bx * ca - by * sa, y = bx * sa + by * ca;
+      r[i] = Math.hypot(x, y); th[i] = Math.atan2(y, x); z[i] = randn() * 0.02;
+      const k = uni(0.03, 0.10) / 255;
+      col[i * 3] = 255 * k; col[i * 3 + 1] = 214 * k; col[i * 3 + 2] = 160 * k;
+    }
+    parts.push({ r, th, z, col });
+  }
+
+  // --- central bulge (a fat warm ball) ---
+  {
+    const n = q(32000);
+    const r = new Float32Array(n), th = new Float32Array(n), z = new Float32Array(n);
+    const col = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const x = randn() * 0.085, y = randn() * 0.085;
+      r[i] = Math.hypot(x, y); th[i] = Math.atan2(y, x); z[i] = randn() * 0.060;
+      const k = uni(0.03, 0.095) / 255;
+      col[i * 3] = 255 * k; col[i * 3 + 1] = 226 * k; col[i * 3 + 2] = 180 * k;
+    }
+    parts.push({ r, th, z, col });
+  }
+
+  // --- tiny bright nucleus ---
+  {
+    const n = q(3500);
+    const r = new Float32Array(n), th = new Float32Array(n), z = new Float32Array(n);
+    const col = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const x = randn() * 0.025, y = randn() * 0.025;
+      r[i] = Math.hypot(x, y); th[i] = Math.atan2(y, x); z[i] = randn() * 0.02;
+      const k = uni(0.08, 0.21) / 255;
+      col[i * 3] = 255 * k; col[i * 3 + 1] = 240 * k; col[i * 3 + 2] = 215 * k;
+    }
+    parts.push({ r, th, z, col });
+  }
+
+  // --- faint halo ---
+  {
+    const n = q(7000);
+    const kept = [];
+    for (let i = 0; i < n; i++) {
+      const x = randn() * 0.55, y = randn() * 0.55, zz = randn() * 0.55;
+      if (Math.hypot(x, y, zz) < 1.3) kept.push([x, y, zz]);
+    }
+    const m = kept.length;
+    const r = new Float32Array(m), th = new Float32Array(m), z = new Float32Array(m);
+    const col = new Float32Array(m * 3);
+    for (let i = 0; i < m; i++) {
+      const [x, y, zz] = kept[i];
+      r[i] = Math.hypot(x, y); th[i] = Math.atan2(y, x); z[i] = zz;
+      const k = uni(0.03, 0.10) / 255;
+      col[i * 3] = 190 * k; col[i * 3 + 1] = 200 * k; col[i * 3 + 2] = 255 * k;
+    }
+    parts.push({ r, th, z, col });
+  }
+
+  // concatenate
+  let n = 0;
+  for (const p of parts) n += p.r.length;
+  const R_ = new Float32Array(n), TH_ = new Float32Array(n), Z_ = new Float32Array(n);
+  const COL_ = new Float32Array(n * 3);
+  let off = 0;
+  for (const p of parts) {
+    R_.set(p.r, off); TH_.set(p.th, off); Z_.set(p.z, off); COL_.set(p.col, off * 3);
+    off += p.r.length;
+  }
+
+  // --- dust lanes: hug the inner edge of each arm ---
+  const dn = q(34000);
+  const DR_ = new Float32Array(dn), DTH_ = new Float32Array(dn);
+  const DZ_ = new Float32Array(dn), DW_ = new Float32Array(dn);
+  for (let i = 0; i < dn; i++) {
+    const dr = 0.07 + 0.70 * Math.pow(rng(), 0.9);
+    DR_[i] = dr;
+    DTH_[i] = coin() * Math.PI + PITCH * Math.log(dr / 0.05 + 1.0) - 0.20 + randn() * (0.09 + 0.06 * dr);
+    DZ_[i] = randn() * 0.007;
+    DW_[i] = uni(0.4, 1.0) * (1.0 - 0.85 * dr);
+  }
+  return { R_, TH_, Z_, COL_, DR_, DTH_, DZ_, DW_ };
+}
+
+function initGalaxy() {
+  const g = build();
+  R = g.R_; TH = g.TH_; Z = g.Z_; COL = g.COL_;
+  DR = g.DR_; DTH = g.DTH_; DZ = g.DZ_; DW = g.DW_;
+  N = R.length;
+  OM = new Float32Array(N);            // slight differential spin
+  DOM = new Float32Array(DR.length);
+  for (let i = 0; i < N; i++) OM[i] = SPIN * (1.0 - 0.22 * Math.min(R[i], 1.0));
+  for (let i = 0; i < DR.length; i++) DOM[i] = SPIN * (1.0 - 0.22 * Math.min(DR[i], 1.0));
+  SHARP_RGB = new Uint8Array(N * 3);
+  for (let i = 0; i < N * 3; i++) SHARP_RGB[i] = clamp(COL[i] * 255.0 * SHARP, 0, 255);
+  fx = new Float32Array(N);
+  fy = new Float32Array(N);
+}
+
+// ----------------------------------------------------------------------------------------
+// View
+// ----------------------------------------------------------------------------------------
+class View {
+  constructor() { this.reset(); }
+  reset() {
+    this.tilt = 1.18;      // 0 = face-on, pi/2 = edge-on
+    this.roll = -0.55;     // in-screen rotation
+    this.zoom = 1.0;
+    this.v_tilt = 0.0;
+    this.v_roll = 0.0;
+  }
+}
+
+// ----------------------------------------------------------------------------------------
+// Array helpers: separable box blur, downsample, bilinear upsample
+// ----------------------------------------------------------------------------------------
+const scratch = new Float32Array(BW * BH + 64);
+const cumBuf = new Float32Array(Math.max(BW, BH) + 32);
+const midBuf = new Float32Array(Math.max(BW * BH, H * 64));
+const glowBuf = new Float32Array(BW * BH);
+const smallBuf = new Float32Array(SW * SH);
+const upBuf = new Float32Array(BW * BH);
+const chR = new Float32Array(BW * BH), chG = new Float32Array(BW * BH), chB = new Float32Array(BW * BH);
+const dens = new Float32Array(BW * BH), atten = new Float32Array(BW * BH);
+
+// in-place box blur via cumulative sums, edge-clamped (same padding as numpy.pad(..., "edge"))
+function blurPass(src, dst, w, h, r) {
+  const win = 2 * r + 1;
+  for (let y = 0; y < h; y++) {                    // horizontal
+    const row = y * w;
+    let c = 0;
+    for (let k = 0; k <= w + 2 * r; k++) {
+      let p = k - (r + 1);
+      if (p < 0) p = 0; else if (p > w - 1) p = w - 1;
+      c += src[row + p];
+      cumBuf[k + 1] = c;
+    }
+    for (let i = 0; i < w; i++) scratch[row + i] = (cumBuf[i + win] - cumBuf[i]) / win;
+  }
+  for (let x = 0; x < w; x++) {                    // vertical
+    let c = 0;
+    for (let k = 0; k <= h + 2 * r; k++) {
+      let p = k - (r + 1);
+      if (p < 0) p = 0; else if (p > h - 1) p = h - 1;
+      c += scratch[p * w + x];
+      cumBuf[k + 1] = c;
+    }
+    for (let i = 0; i < h; i++) dst[i * w + x] = (cumBuf[i + win] - cumBuf[i]) / win;
+  }
+}
+
+const tableCache = new Map();
+function axisTables(nIn, nOut, k) {
+  const key = nIn + ":" + nOut + ":" + k;
+  let t = tableCache.get(key);
+  if (t) return t;
+  const i0 = new Int32Array(nOut), i1 = new Int32Array(nOut), f = new Float32Array(nOut);
+  for (let i = 0; i < nOut; i++) {
+    let pos = (i + 0.5) / k - 0.5;
+    pos = clamp(pos, 0, nIn - 1);
+    let a = Math.floor(pos); if (a > nIn - 1) a = nIn - 1;
+    let b = a + 1; if (b > nIn - 1) b = nIn - 1;
+    i0[i] = a; i1[i] = b; f[i] = pos - a;
+  }
+  t = [i0, i1, f];
+  tableCache.set(key, t);
+  return t;
+}
+
+function down2(src, dst) {                 // 2x2 block average
+  for (let y = 0; y < SH; y++) {
+    for (let x = 0; x < SW; x++) {
+      const a = (2 * y) * BW + 2 * x;
+      dst[y * SW + x] = (src[a] + src[a + 1] + src[a + BW] + src[a + BW + 1]) * 0.25;
+    }
+  }
+}
+
+function upN(src, sw, sh, dst, dw, dh, k) {  // bilinear upsample (rows first, then columns)
+  const [r0, r1, fr] = axisTables(sh, dh, k);
+  for (let y = 0; y < dh; y++) {
+    const a = r0[y] * sw, b = r1[y] * sw, o = y * sw, f = fr[y];
+    for (let x = 0; x < sw; x++) midBuf[o + x] = src[a + x] * (1 - f) + src[b + x] * f;
+  }
+  const [c0, c1, fc] = axisTables(sw, dw, k);
+  for (let y = 0; y < dh; y++) {
+    const row = y * sw, o = y * dw;
+    for (let x = 0; x < dw; x++) {
+      const a = c0[x], b = c1[x], f = fc[x];
+      dst[o + x] = midBuf[row + a] * (1 - f) + midBuf[row + b] * f;
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------------------
+// Render
+// ----------------------------------------------------------------------------------------
+const canvas = document.getElementById("sky");
+const ctx = canvas.getContext("2d", { alpha: false });
+
+const glowCanvas = document.createElement("canvas");
+glowCanvas.width = BW; glowCanvas.height = BH;
+const gctx = glowCanvas.getContext("2d");
+const glowImg = gctx.createImageData(BW, BH);
+
+const sharpCanvas = document.createElement("canvas");
+sharpCanvas.width = W; sharpCanvas.height = H;
+const sctx = sharpCanvas.getContext("2d");
+const sharpImg = sctx.createImageData(W, H);
+
+function render(view, t, lod, gain) {
+  const s = lod, g = 2 * s;
+  const ct = Math.cos(view.tilt), st = Math.sin(view.tilt);
+  const cr = Math.cos(view.roll), sr = Math.sin(view.roll);
+  const k = R_PX * view.zoom, cx = W / 2, cy = H / 2;
+  const M = ((N - 1) / s | 0) + 1;
+
+  for (let i = 0, j = 0; j < M; i += s, j++) {           // project the (strided) stars
+    const a = TH[i] + OM[i] * t, r = R[i];
+    const x = r * Math.cos(a), y = r * Math.sin(a), z = Z[i];
+    const y2 = y * ct - z * st;
+    fx[j] = cx + (x * cr - y2 * sr) * k;
+    fy[j] = cy + (x * sr + y2 * cr) * k;
+  }
+
+  // ---- soft glow layer (low resolution) ----
+  chR.fill(0); chG.fill(0); chB.fill(0);
+  for (let j = 0; j < M; j += 2) {
+    const i = j * s;
+    const ix = (fx[j] * RS) | 0, iy = (fy[j] * RS) | 0;
+    if (ix < 0 || ix >= BW || iy < 0 || iy >= BH) continue;
+    const o = iy * BW + ix, c = i * 3;
+    chR[o] += COL[c] * g; chG[o] += COL[c + 1] * g; chB[o] += COL[c + 2] * g;
+  }
+
+  dens.fill(0);
+  for (let i = 0; i < DR.length; i += g) {                // dust
+    const a = DTH[i] + DOM[i] * t, r = DR[i];
+    const x = r * Math.cos(a), y = r * Math.sin(a), z = DZ[i];
+    const y2 = y * ct - z * st;
+    const sx = cx + (x * cr - y2 * sr) * k, sy = cy + (x * sr + y2 * cr) * k;
+    const ix = (sx * RS) | 0, iy = (sy * RS) | 0;
+    if (ix < 0 || ix >= BW || iy < 0 || iy >= BH) continue;
+    dens[iy * BW + ix] += DW[i] * g;
+  }
+  blurPass(dens, dens, BW, BH, 1);
+  blurPass(dens, dens, BW, BH, 1);
+  for (let i = 0; i < dens.length; i++) atten[i] = Math.exp(-DUST * 2.2 * dens[i]);
+
+  const imgs = [chR, chG, chB];
+  for (const img of imgs) {
+    for (let i = 0; i < img.length; i++) img[i] *= atten[i];
+    // wide + narrow bloom
+    blurPass(img, glowBuf, BW, BH, 2);
+    blurPass(glowBuf, glowBuf, BW, BH, 2);
+    down2(img, smallBuf);
+    blurPass(smallBuf, smallBuf, SW, SH, 4);
+    blurPass(smallBuf, smallBuf, SW, SH, 4);
+    upN(smallBuf, SW, SH, upBuf, BW, BH, 2);
+    for (let i = 0; i < img.length; i++) img[i] += 0.9 * glowBuf[i] + 0.7 * upBuf[i];
+  }
+
+  // soft tone-mapping: bright core never hard-clips
+  const gd = glowImg.data;
+  for (let i = 0, p = 0; i < chR.length; i++, p += 4) {
+    gd[p] = (1.0 - Math.exp(-chR[i] * gain)) * 255;
+    gd[p + 1] = (1.0 - Math.exp(-chG[i] * gain)) * 255;
+    gd[p + 2] = (1.0 - Math.exp(-chB[i] * gain)) * 255;
+    gd[p + 3] = 255;
+  }
+
+  // ---- crisp stars: one pixel each at full resolution, dimmed where dust lies in front ----
+  const sd = sharpImg.data;
+  sd.fill(0);
+  for (let j = 0; j < M; j++) {
+    const ix = fx[j] | 0, iy = fy[j] | 0;
+    if (ix < 0 || ix >= W || iy < 0 || iy >= H) continue;
+    const cx2 = clamp((ix * RS) | 0, 0, BW - 1);
+    const cy2 = clamp((iy * RS) | 0, 0, BH - 1);
+    const d = atten[cy2 * BW + cx2];
+    const i = j * s, c = i * 3, o = (iy * W + ix) * 4;
+    sd[o] = SHARP_RGB[c] * d;
+    sd[o + 1] = SHARP_RGB[c + 1] * d;
+    sd[o + 2] = SHARP_RGB[c + 2] * d;
+    sd[o + 3] = 255;
+  }
+}
+
+// ----------------------------------------------------------------------------------------
+// Background: nebula backdrop, starfield, vignette, twinkles
+// ----------------------------------------------------------------------------------------
+function fbm(r2, h, w) {                  // soft cloudy noise in 0..1
+  const f = new Float32Array(h * w);
+  const tmp = new Float32Array(h * w);
+  const amps = [1.0, 0.5, 0.25, 0.12], ks = [220, 110, 55, 28];
+  let sum = 0;
+  for (let o = 0; o < 4; o++) {
+    const k = ks[o], a = amps[o];
+    sum += a;
+    const gh = (h / k | 0) + 2, gw = (w / k | 0) + 2;
+    const grid = new Float32Array(gh * gw);
+    for (let i = 0; i < grid.length; i++) grid[i] = r2();
+    upN(grid, gw, gh, tmp, w, h, k);
+    for (let i = 0; i < f.length; i++) f[i] += a * tmp[i];
+  }
+  for (let i = 0; i < f.length; i++) f[i] /= sum;
+  return f;
+}
+
+function makeBackdrop() {                 // very faint violet / teal nebula clouds
+  const r2 = makeRng(21);
+  const a = fbm(r2, H, W), b = fbm(r2, H, W);
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const bx = c.getContext("2d");
+  const img = bx.createImageData(W, H);
+  const d = img.data;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x, p = i * 4;
+      const cloud = Math.pow(clamp((a[i] - 0.50) * 3.4, 0, 1), 2);
+      const tt = clamp((b[i] - 0.35) * 3.0, 0, 1);
+      const cr = 115 * (1 - tt) + 40 * tt;
+      const cg = 60 * (1 - tt) + 115 * tt;
+      const cb = 175 * (1 - tt) + 160 * tt;
+      d[p] = clamp(cr * cloud * 0.17, 0, 255);
+      d[p + 1] = clamp(cg * cloud * 0.17, 0, 255);
+      d[p + 2] = clamp(cb * cloud * 0.17, 0, 255);
+      d[p + 3] = 255;
+    }
+  }
+  bx.putImageData(img, 0, 0);
+  return c;
+}
+
+function makeStarfield() {
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const x = c.getContext("2d");
+  x.fillStyle = "#000"; x.fillRect(0, 0, W, H);
+  const r2 = makeRng(5);
+  for (let i = 0; i < 650; i++) {
+    const px = (r2() * W) | 0, py = (r2() * H) | 0;
+    const v = (40 + 160 * Math.pow(r2(), 3)) | 0;
+    const tint = r2();
+    x.fillStyle = tint < 0.5
+      ? `rgb(${v},${v},${Math.min(255, v + 40)})`
+      : `rgb(${Math.min(255, v + 30)},${v},${v > 10 ? v - 10 : v})`;
+    x.fillRect(px, py, 1, 1);
+  }
+  for (let i = 0; i < 26; i++) {           // a few bright stars with a soft glow + cross
+    const px = (20 + r2() * (W - 40)) | 0, py = (20 + r2() * (H - 40)) | 0;
+    for (const [rad, a] of [[6, 18], [4, 40], [2, 110]]) {
+      x.fillStyle = `rgb(${a},${a},${a + 15})`;
+      x.beginPath(); x.arc(px, py, rad, 0, TAU); x.fill();
+    }
+    x.strokeStyle = "rgb(110,110,135)";
+    x.lineWidth = 1;
+    x.beginPath();
+    x.moveTo(px - 7, py + 0.5); x.lineTo(px + 7, py + 0.5);
+    x.moveTo(px + 0.5, py - 7); x.lineTo(px + 0.5, py + 7);
+    x.stroke();
+    x.fillStyle = "#fff"; x.fillRect(px, py, 1, 1);
+  }
+  x.globalCompositeOperation = "lighter";
+  x.drawImage(makeBackdrop(), 0, 0);
+  return c;
+}
+
+function makeVignette() {                 // gently darkens the corners
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const x = c.getContext("2d");
+  const img = x.createImageData(W, H), d = img.data;
+  for (let y = 0; y < H; y++) {
+    for (let px = 0; px < W; px++) {
+      const dd = Math.hypot((px - W / 2) / (W / 2), (y - H / 2) / (H / 2));
+      const v = clamp(1.0 - 0.38 * Math.pow(Math.max(dd - 0.45, 0), 1.6), 0, 1) * 255;
+      const p = (y * W + px) * 4;
+      d[p] = v; d[p + 1] = v; d[p + 2] = v; d[p + 3] = 255;
+    }
+  }
+  x.putImageData(img, 0, 0);
+  return c;
+}
+
+function makeTwinkles(n = 130) {
+  const r3 = makeRng(8);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push([(r3() * W) | 0, (r3() * H) | 0, (70 + 150 * Math.pow(r3(), 2)) | 0,
+              0.6 + 2.4 * r3(), TAU * r3(), r3() < 0.12]);
+  }
+  return out;
+}
+
+function drawTwinkles(list, now) {
+  ctx.globalCompositeOperation = "lighter";
+  for (const [x, y, v, sp, ph, cross] of list) {
+    const c = (v * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(sp * now + ph)))) | 0;
+    ctx.fillStyle = `rgb(${c},${c},${Math.min(255, c + 25)})`;
+    ctx.fillRect(x, y, 1, 1);
+    if (cross) {
+      const h = (c / 3) | 0;
+      ctx.fillStyle = `rgb(${h},${h},${Math.min(255, h + 10)})`;
+      ctx.fillRect(x - 2, y, 5, 1);
+      ctx.fillRect(x, y - 2, 1, 5);
+    }
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+class ShootingStar {                      // a rare streak across the sky
+  constructor() {
+    const side = Math.random() < 0.5 ? 1 : -1;
+    this.x = (0.1 + Math.random() * 0.8) * W;
+    this.y = (0.02 + Math.random() * 0.33) * H;
+    const a = (18 + Math.random() * 20) * Math.PI / 180;
+    this.dx = side * Math.cos(a); this.dy = Math.sin(a);
+    this.speed = 850 + Math.random() * 350;
+    this.age = 0;
+  }
+  get alive() { return this.age < 0.9; }
+  draw(dt) {
+    this.age += dt;
+    const fade = Math.sin(Math.PI * Math.min(this.age / 0.9, 1.0));
+    const hx = this.x + this.dx * this.speed * this.age;
+    const hy = this.y + this.dy * this.speed * this.age;
+    const length = 150 * (0.4 + 0.6 * fade), seg = 16;
+    for (let i = 0; i < seg; i++) {
+      const f = 1 - i / seg;
+      const c = (255 * f * f * fade) | 0;
+      if (c < 4) continue;
+      ctx.strokeStyle = `rgb(${c},${c},${Math.min(255, c + 30)})`;
+      ctx.lineWidth = i < 6 ? 2 : 1;
+      ctx.beginPath();
+      ctx.moveTo(hx - this.dx * length * i / seg, hy - this.dy * length * i / seg);
+      ctx.lineTo(hx - this.dx * length * (i + 1) / seg, hy - this.dy * length * (i + 1) / seg);
+      ctx.stroke();
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------------------
+// "YOU ARE HERE" marker, pinned to a fixed spot in the disk
+// ----------------------------------------------------------------------------------------
+const YAH_R = 0.58;
+const YAH_TH = PITCH * Math.log(YAH_R / 0.05 + 1.0) + Math.PI / 2;
+const YAH_OM = SPIN * (1.0 - 0.22 * YAH_R);
+const SERIF = 'Georgia, "Palatino Linotype", Palatino, Garamond, "Times New Roman", "DejaVu Serif", serif';
+
+function trackedWidth(text, font, spacing) {
+  ctx.font = font;
+  let w = 0;
+  for (const ch of text) w += ctx.measureText(ch).width + spacing;
+  return w - (text.length ? spacing : 0);
+}
+
+function drawTracked(text, x, y, font, spacing, color, alpha) {
+  ctx.font = font;
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.textBaseline = "top";
+  let cx = x;
+  for (const ch of text) {
+    ctx.fillText(ch, cx, y);
+    cx += ctx.measureText(ch).width + spacing;
+  }
+}
+
+function drawPathPartial(pts, frac, color, alpha, width) {
+  const segs = [];
+  let total = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const ln = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+    segs.push(ln); total += ln;
+  }
+  let left = total * frac;
+  if (left <= 0) return;
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 0; i < segs.length; i++) {
+    if (left <= 0) break;
+    const ln = segs[i];
+    const k = ln > 0 ? Math.min(1, left / ln) : 1;
+    const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];
+    ctx.lineTo(x0 + (x1 - x0) * k, y0 + (y1 - y0) * k);
+    left -= ln;
+  }
+  ctx.stroke();
+}
+
+class YouAreHere {
+  constructor() {
+    this.INK = "rgb(246,238,220)";
+    this.DIM = "rgb(196,188,168)";
+    this.titleFont = "15px " + SERIF;
+    this.subFont = "italic 16px " + SERIF;
+    this.titleW = trackedWidth("YOU ARE HERE", this.titleFont, 3);
+    this.subW = (() => { ctx.font = this.subFont; return ctx.measureText("probably").width; })();
+    this.subH = 16;
+    this.alpha = 0.0;
+  }
+
+  draw(view, t, now, show, dt) {
+    this.alpha += ((show ? 1.0 : 0.0) - this.alpha) * Math.min(1.0, dt * 2.2);
+    const a = this.alpha;
+    if (a < 0.01) return;
+    const e = a * a * (3.0 - 2.0 * a);
+
+    const ct = Math.cos(view.tilt), st = Math.sin(view.tilt);
+    const cr = Math.cos(view.roll), sr = Math.sin(view.roll);
+    const k = R_PX * view.zoom;
+    const ang = YAH_TH + YAH_OM * t;
+    const x = YAH_R * Math.cos(ang), y = YAH_R * Math.sin(ang);
+    const y2 = y * ct;
+    const px = W / 2 + (x * cr - y2 * sr) * k;
+    const py = H / 2 + (x * sr + y2 * cr) * k;
+    if (!(px > -80 && px < W + 80 && py > -80 && py < H + 80)) return;
+
+    const ink = this.INK;
+    const R0 = 7;
+
+    // soft breathing halo
+    const pulse = 0.75 + 0.25 * Math.sin(now * 2.0);
+    const ga = (210 / 255) * e * pulse;
+    const grad = ctx.createRadialGradient(px, py, 0, px, py, 26);
+    for (const [d, f] of [[0, 1], [0.25, 0.53], [0.5, 0.217], [0.75, 0.047], [1, 0]]) {
+      grad.addColorStop(d, `rgba(255,236,200,${(ga * f).toFixed(4)})`);
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(px, py, 26, 0, TAU); ctx.fill();
+
+    // core: thin ring + pin-prick centre
+    ctx.strokeStyle = ink; ctx.lineWidth = 1;
+    ctx.globalAlpha = (235 / 255) * e;
+    ctx.beginPath(); ctx.arc(px, py, R0, 0, TAU); ctx.stroke();
+    ctx.fillStyle = ink;
+    ctx.globalAlpha = e;
+    ctx.beginPath(); ctx.arc(px, py, 2, 0, TAU); ctx.fill();
+
+    // slow ripple that expands and dissolves
+    const ph = (now * 0.45) % 1.0;
+    ctx.globalAlpha = (150 / 255) * e * Math.pow(1.0 - ph, 1.5);
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(px, py, R0 + 3 + 16 * ph, 0, TAU); ctx.stroke();
+
+    // four hairline ticks, slowly turning
+    for (let i = 0; i < 4; i++) {
+      const an = now * 0.25 + i * Math.PI / 2;
+      const c = Math.cos(an), s = Math.sin(an);
+      ctx.globalAlpha = (200 / 255) * e;
+      ctx.beginPath();
+      ctx.moveTo(px + c * (R0 + 4), py + s * (R0 + 4));
+      ctx.lineTo(px + c * (R0 + 9), py + s * (R0 + 9));
+      ctx.stroke();
+    }
+
+    // label geometry: up-and-right by default, flips if it would leave the screen
+    const tw = this.titleW, th = 18, bw = Math.max(tw, this.subW), pad = 7;
+    const lineLen = bw + 2 * pad;
+    const dx = (px + 36 + lineLen < W - 10) ? 1 : -1;
+    const dy = (py - 36 - th - 8 > 10) ? -1 : 1;
+    const k45 = 0.7071;
+    const P0 = [px + dx * (R0 + 11) * k45, py + dy * (R0 + 11) * k45];
+    const A = [px + dx * 36, py + dy * 36];
+    const B = [A[0] + dx * lineLen, A[1]];
+    const path = [P0, A, B];
+    const shadowPath = path.map(([x1, y1]) => [x1 + 1, y1 + 1]);
+
+    // leader line "writes itself in" (with a faint dark under-stroke for contrast)
+    drawPathPartial(shadowPath, e, "rgb(0,0,0)", (110 / 255) * e, 1);
+    drawPathPartial(path, e, ink, (215 / 255) * e, 1);
+    ctx.fillStyle = ink;
+    ctx.globalAlpha = e;
+    ctx.beginPath(); ctx.arc(A[0], A[1], 2, 0, TAU); ctx.fill();
+
+    // text fades in once the line is mostly drawn
+    const te = Math.max(0.0, (e - 0.45) / 0.55);
+    const ai = te;
+    const tx = dx === 1 ? A[0] + pad : A[0] - pad - tw;
+    const sx = dx === 1 ? A[0] + pad : A[0] - pad - this.subW;
+    const ty = A[1] - th - 5;
+    const sy = A[1] + 5;
+    if (ai > 0.003) {
+      drawTracked("YOU ARE HERE", tx + 1, ty + 1, this.titleFont, 3, "rgb(0,0,0)", ai * 0.75);
+      drawTracked("YOU ARE HERE", tx, ty, this.titleFont, 3, ink, ai);
+      ctx.font = this.subFont;
+      ctx.textBaseline = "top";
+      ctx.globalAlpha = ai * 0.75;
+      ctx.fillStyle = "rgb(0,0,0)";
+      ctx.fillText("probably", sx + 1, sy + 1);
+      ctx.globalAlpha = ai;
+      ctx.fillStyle = this.DIM;
+      ctx.fillText("probably", sx, sy);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ----------------------------------------------------------------------------------------
+// Taurus: her constellation, pinned to the sky in the top-right corner
+// ----------------------------------------------------------------------------------------
+class Taurus {
+  constructor() {
+    this.ORIGIN = [W - 290, 62];
+    this.PTS = {
+      elnath: [20, 30], zeta: [28, 118], aldebaran: [118, 98],
+      gamma: [140, 86], delta: [156, 70], epsilon: [170, 60], pleiades: [225, 28],
+    };
+    this.LINES = [["elnath", "aldebaran"], ["zeta", "aldebaran"], ["aldebaran", "gamma"],
+                  ["gamma", "delta"], ["delta", "epsilon"], ["epsilon", "pleiades"]];
+    this.INK = "rgb(246,238,220)";
+    const r = makeRng(4);
+    const [px, py] = this.PTS.pleiades;
+    this.cluster = [];
+    for (let i = 0; i < 7; i++) {
+      this.cluster.push([px + randnOf(r) * 6, py + randnOf(r) * 5,
+                         0.5 + r() * 0.5, 0.8 + r() * 1.4, TAU * r()]);
+    }
+    this.alpha = 0.0;
+  }
+
+  star(x, y, rad, color, a) {
+    for (const [rr, aa] of [[rad * 4.0, 0.10], [rad * 2.6, 0.18], [rad * 1.6, 0.35]]) {
+      ctx.globalAlpha = aa * a;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(x, y, Math.max(1, rr), 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = a;
+    ctx.beginPath(); ctx.arc(x, y, Math.max(1, rad), 0, TAU); ctx.fill();
+  }
+
+  draw(now, show, dt) {
+    this.alpha += ((show ? 1.0 : 0.0) - this.alpha) * Math.min(1.0, dt * 1.6);
+    const a = this.alpha;
+    if (a < 0.01) return;
+    const e = a * a * (3.0 - 2.0 * a);
+    const [ox, oy] = this.ORIGIN;
+    const P = this.PTS;
+    const at = n => [ox + P[n][0], oy + P[n][1]];
+
+    for (const [u, v] of this.LINES) {              // constellation lines, hairline and dim
+      const [x0, y0] = at(u), [x1, y1] = at(v);
+      ctx.globalAlpha = (70 / 255) * e;
+      ctx.strokeStyle = this.INK;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    }
+
+    const tw = (sp, ph) => 0.78 + 0.22 * Math.sin(now * sp + ph);
+    this.star(ox + P.aldebaran[0], oy + P.aldebaran[1], 3.4, "rgb(255,176,118)", e * tw(1.3, 0.4));
+    for (const [name, rad, sp, ph] of [["elnath", 2.4, 1.7, 1.0], ["zeta", 2.0, 1.1, 2.1],
+                                        ["gamma", 2.0, 1.9, 3.0], ["delta", 1.8, 1.5, 4.0],
+                                        ["epsilon", 2.0, 1.2, 5.0]]) {
+      this.star(ox + P[name][0], oy + P[name][1], rad, "rgb(232,236,255)", e * tw(sp, ph));
+    }
+    for (const [x, y, b, sp, ph] of this.cluster) {  // the Pleiades
+      this.star(ox + x, oy + y, 1.0 + 0.6 * b, "rgb(190,210,255)", e * b * tw(sp, ph));
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+// a local normal distribution for the Pleiades scatter
+function randnOf(r) {
+  let u, v, s;
+  do { u = r() * 2 - 1; v = r() * 2 - 1; s = u * u + v * v; } while (s >= 1 || s === 0);
+  return u * Math.sqrt(-2 * Math.log(s) / s);
+}
+
+// ----------------------------------------------------------------------------------------
+// Music: a soft ambient pad (plus your own music.mp3/ogg/wav if one sits next to this file)
+// ----------------------------------------------------------------------------------------
+const CHORDS = [
+  [45, 52, 57, 60, 64, 71],   // Am9
+  [41, 48, 57, 60, 64, 69],   // Fmaj7
+  [48, 52, 55, 62, 64, 71],   // Cmaj9
+  [43, 50, 55, 59, 64, 69],   // G6
+];
+let AC = null, master = null;
+
+function hz(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+function ensureAudio() {
+  if (AC) { if (AC.state === "suspended") AC.resume().catch(() => {}); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+  } catch (err) { return; }
+  master = AC.createGain();
+  master.gain.value = MUSIC_VOLUME;
+  master.connect(AC.destination);
+  loadMusicFile();
+}
+
+async function loadMusicFile() {
+  for (const name of ["music.mp3", "music.ogg", "music.wav"]) {
+    try {
+      const res = await fetch(name, { cache: "force-cache" });
+      if (!res.ok) continue;
+      const buf = await AC.decodeAudioData(await res.arrayBuffer());
+      const src = AC.createBufferSource();
+      src.buffer = buf; src.loop = true;
+      src.connect(master);
+      src.start(0);
+      return;
+    } catch (err) { /* try the next extension */ }
+  }
+  startPad();
+}
+
+function startPad() {
+  const D = 7.0;
+  const curve = new Float32Array(65);
+  for (let i = 0; i < curve.length; i++) curve[i] = Math.pow(Math.cos((i / (curve.length - 1)) * Math.PI / 2), 2);
+  const brng = makeRng(3);
+  const scale = [69, 72, 74, 76, 79, 81, 84];
+
+  function chord(start, notes, i) {
+    const g = AC.createGain();
+    g.gain.value = 0;
+    g.connect(master);
+    g.gain.setValueCurveAtTime(curve, start, D);
+    notes.forEach((m, k) => {
+      const f = hz(m);
+      const o = AC.createOscillator(); o.type = "sine"; o.frequency.value = f;
+      const o2 = AC.createOscillator(); o2.type = "sine"; o2.frequency.value = f * 2;
+      const g2 = AC.createGain(); g2.gain.value = 0.28;
+      const n1 = AC.createGain(); n1.gain.value = (m < 55 ? 0.55 : 0.32) * 0.17;
+      const lvl = AC.createGain(); lvl.gain.value = 1;
+      const lfo = AC.createOscillator(); lfo.frequency.value = 0.35 + k * 0.07 + i * 0.11;
+      const lg = AC.createGain(); lg.gain.value = 0.15;
+      lfo.connect(lg); lg.connect(lvl.gain);
+      o.connect(n1); o2.connect(g2); g2.connect(n1); n1.connect(lvl);
+      let tail = lvl;
+      if (AC.createStereoPanner) {
+        const pan = AC.createStereoPanner();
+        pan.pan.value = 0.25 + 0.5 * ((k * 0.37 + i * 0.19) % 1.0);
+        lvl.connect(pan); tail = pan;
+      }
+      tail.connect(g);
+      o.start(start); o.stop(start + D + 0.05);
+      o2.start(start); o2.stop(start + D + 0.05);
+      lfo.start(start); lfo.stop(start + D + 0.05);
+    });
+  }
+
+  function bells(loopStart) {
+    const T = D * CHORDS.length;
+    for (let b = 0; b < Math.floor(T / 2.6); b++) {
+      const start = loopStart + b * 2.6 + brng() * 1.2;
+      const f = hz(scale[(brng() * scale.length) | 0]);
+      const o = AC.createOscillator(); o.type = "sine"; o.frequency.value = f;
+      const g = AC.createGain();
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.linearRampToValueAtTime(0.07, start + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 4.5);
+      let tail = g;
+      if (AC.createStereoPanner) {
+        const pan = AC.createStereoPanner();
+        pan.pan.value = 0.2 + brng() * 0.6;
+        g.connect(pan); tail = pan;
+      }
+      o.connect(g);
+      tail.connect(master);
+      o.start(start); o.stop(start + 4.6);
+    }
+  }
+
+  let next = AC.currentTime + 0.3;
+  function schedule() {
+    while (next < AC.currentTime + 12) {
+      CHORDS.forEach((c, i) => chord(next + i * D, c, i));
+      bells(next);
+      next += D * CHORDS.length;
+    }
+  }
+  schedule();
+  setInterval(() => { if (AC.state === "running") schedule(); }, 4000);
+}
+
+// ----------------------------------------------------------------------------------------
+// The poem
+// ----------------------------------------------------------------------------------------
+const POEM = [
+  "I’m still learning her",
+  "the way you learn a sky:",
+  "not all at once,",
+  "but one quiet night at a time,",
+  "until the dark",
+  "stops feeling strange",
+  "and starts feeling like home.",
+];
+const TEXT_COLOR = "rgb(228,228,70)";
+const TEXT_SIZE = 30;
+
+function makeText() {
+  const font = TEXT_SIZE + "px Verdana, DejaVu Sans, Trebuchet MS, Arial, sans-serif";
+  const lh = Math.round(TEXT_SIZE * 1.2 * 1.15);
+  const c = document.createElement("canvas");
+  c.width = W; c.height = lh * POEM.length + 12;
+  const x = c.getContext("2d");
+  x.font = font;
+  x.textBaseline = "top";
+  POEM.forEach((line, i) => {
+    x.fillStyle = "rgb(0,0,0)";
+    for (const [ox, oy] of [[2, 2], [-1, 2], [2, -1]]) x.fillText(line, 50 + ox, 6 + i * lh + oy);
+    x.fillStyle = TEXT_COLOR;
+    x.fillText(line, 50, 6 + i * lh);
+  });
+  return c;
+}
+
+function introView(view, p) {           // opening shot: far-away spark glides in and tilts over
+  const e = 1.0 - Math.pow(1.0 - p, 3.2);
+  const z0 = 0.035, z1 = 1.0;
+  view.zoom = Math.exp(Math.log(z0) + (Math.log(z1) - Math.log(z0)) * e);
+  view.tilt = 0.30 + (1.18 - 0.30) * e;
+  view.roll = -2.4 + (-0.55 + 2.4) * e;
+  return e;
+}
+
+// ----------------------------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------------------------
+function start() {
+  initGalaxy();
+
+  const text = makeText();
+  const yah = new YouAreHere();
+  const taurus = new Taurus();
+  const stars = makeStarfield();
+  const twinkles = makeTwinkles();
+  const vignette = makeVignette();
+  const shooters = [];
+
+  const view = new View();
+  let t = 0, clockT = 0;
+  let intro_t = INTRO > 0 ? 0 : 1e9, ease = 0;
+  let dragging = false, paused = false, running = true, raf = 0;
+  let showText = true, textAlpha = 0, showYah = true, showTaurus = true;
+  let lod = 1, avgMs = 16, cooldown = 0;
+  let mouseDX = 0, mouseDY = 0, lastPX = 0, lastPY = 0;
+  let nextShoot = 9.0, muted = false;
+  let last = performance.now();
+
+  const skipIntro = () => {
+    if (intro_t < INTRO) { view.reset(); ease = 1.0; intro_t = INTRO; }
+  };
+
+  canvas.addEventListener("pointerdown", e => {
+    ensureAudio();
+    skipIntro();
+    dragging = true;
+    view.v_tilt = view.v_roll = 0;
+    mouseDX = mouseDY = 0;
+    lastPX = e.clientX; lastPY = e.clientY;
+    canvas.classList.add("grabbing");
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  });
+  canvas.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    const sc = W / rect.width;
+    mouseDX += (e.clientX - lastPX) * sc;
+    mouseDY += (e.clientY - lastPY) * sc;
+    lastPX = e.clientX; lastPY = e.clientY;
+  });
+  const endDrag = () => { dragging = false; canvas.classList.remove("grabbing"); };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    ensureAudio();
+    skipIntro();
+    view.zoom = clamp(view.zoom * Math.pow(1.1, -Math.sign(e.deltaY)), 0.4, 3.0);
+  }, { passive: false });
+
+  window.addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    if (["escape", "q", " ", "r", "t", "y", "z", "m"].indexOf(k) < 0) return;
+    e.preventDefault();
+    if (k === "escape" || k === "q") { running = false; return; }
+    ensureAudio();
+    if (k === " ") paused = !paused;
+    else if (k === "r") view.reset();
+    else if (k === "t") showText = !showText;
+    else if (k === "y") showYah = !showYah;
+    else if (k === "z") showTaurus = !showTaurus;
+    else if (k === "m") { muted = !muted; if (master) master.gain.value = muted ? 0 : MUSIC_VOLUME; }
+  });
+
+  function loop(now) {
+    if (!running) {
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, W, H);
+      return;
+    }
+    raf = requestAnimationFrame(loop);
+    const dt = Math.min((now - last) / 1000.0, 0.05);
+    last = now;
+    clockT += dt;
+
+    const introOn = intro_t < INTRO;
+    if (introOn) {
+      intro_t += dt;
+      if (intro_t >= INTRO) { view.reset(); ease = 1.0; }
+      else { ease = introView(view, intro_t / INTRO); view.v_tilt = view.v_roll = 0; }
+    }
+
+    if (dragging && !introOn) {
+      view.v_roll = mouseDX * 0.006 / Math.max(dt, 1e-3) * 0.25;
+      view.v_tilt = mouseDY * 0.006 / Math.max(dt, 1e-3) * 0.25;
+      view.roll += mouseDX * 0.006;
+      view.tilt += mouseDY * 0.006;
+      mouseDX = mouseDY = 0;
+    } else if (!introOn) {
+      view.roll += view.v_roll * dt;
+      view.tilt += view.v_tilt * dt;
+      const damp = Math.exp(-3.0 * dt);
+      view.v_roll *= damp;
+      view.v_tilt *= damp;
+    }
+    view.tilt = clamp(view.tilt, -Math.PI / 2 + 0.02, Math.PI / 2 - 0.02);
+
+    if (!paused) t += dt * (introOn ? (1.0 + 7.0 * Math.pow(1.0 - ease, 2)) : 1.0);
+
+    const gain = GAIN * Math.min(1.0, Math.pow(view.zoom, 1.1));   // keep a far-away galaxy from blowing out
+    render(view, t, lod, gain);
+
+    gctx.putImageData(glowImg, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(glowCanvas, 0, 0, W, H);
+    sctx.putImageData(sharpImg, 0, 0);
+    ctx.globalCompositeOperation = "lighter";
+    ctx.drawImage(sharpCanvas, 0, 0);
+    ctx.drawImage(stars, 0, 0);
+
+    drawTwinkles(twinkles, clockT);
+    if (!introOn) {
+      nextShoot -= dt;
+      if (nextShoot <= 0) { shooters.push(new ShootingStar()); nextShoot = 7 + Math.random() * 9; }
+    }
+    ctx.globalCompositeOperation = "source-over";
+    for (let i = shooters.length - 1; i >= 0; i--) {
+      shooters[i].draw(dt);
+      if (!shooters[i].alive) shooters.splice(i, 1);
+    }
+
+    ctx.globalCompositeOperation = "multiply";                  // darken the corners
+    ctx.drawImage(vignette, 0, 0);
+    ctx.globalCompositeOperation = "source-over";
+
+    // "YOU ARE HERE" and Taurus (after the vignette so they stay bright)
+    yah.draw(view, t, clockT, showYah && !introOn, dt);
+    taurus.draw(clockT, showTaurus && !introOn, dt);
+
+    if (introOn && intro_t < 3.0) {                              // fade up from black at the start
+      ctx.globalAlpha = Math.pow(1.0 - intro_t / 3.0, 1.5);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+
+    if (!introOn) textAlpha += ((showText ? 1.0 : 0.0) - textAlpha) * Math.min(1.0, dt * 2.5);
+    if (textAlpha > 0.01) {
+      ctx.globalAlpha = textAlpha;
+      ctx.drawImage(text, 0, (H * 0.36) | 0);
+      ctx.globalAlpha = 1;
+    }
+
+    // adaptive detail: keep the frame rate smooth on slower computers
+    avgMs = avgMs * 0.93 + dt * 1000 * 0.07;
+    cooldown -= 1;
+    if (cooldown <= 0) {
+      if (avgMs > 24 && lod < 4) { lod += 1; cooldown = 45; }
+      else if (avgMs < 12 && lod > 1) { lod -= 1; cooldown = 90; }
+    }
+  }
+
+  raf = requestAnimationFrame(loop);
+  window.__galaxy = {                    // handy for console checks / tuning
+    get fps() { return Math.round(1000 / Math.max(avgMs, 1)); },
+    get lod() { return lod; },
+    set lod(v) { lod = clamp(v | 0, 1, 4); cooldown = 1e9; },
+    get stars() { return N; },
+    view,
+  };
+}
+
+start();
+</script>
+</body>
+</html>
