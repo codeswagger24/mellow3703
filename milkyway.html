@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>milkyway.py</title>
+</head>
+<body>
+<pre><code>
+\"\"\"
+Interactive spiral galaxy (Milky Way / Andromeda style).
+
+Controls
+  Left-click + drag : grab the galaxy and tilt / rotate it (keeps drifting with inertia)
+  Mouse wheel       : zoom   (touching the mouse during the opening skips it)
+  Space             : pause / resume spin
+  R                 : reset view
+  T                 : show / hide the text
+  Y                 : show / hide \"YOU ARE HERE\"
+  Z                 : show / hide the Taurus constellation
+  M                 : mute / unmute the music
+  Esc / Q           : quit
+
+Install:  pip install pygame numpy
+Run:      python milkyway.py
+\"\"\"
+import math
+import os
+import random
+
+import numpy as np
+import pygame
+
+W, H = 1000, 800
+RS = 0.25                        # galaxy is rendered at this fraction of screen size, then smooth-scaled up
+BW, BH = int(W * RS), int(H * RS)
+R_PX = 470.0                     # galaxy radius in screen pixels at zoom 1
+QUALITY = 1.0                    # 0.5 = faster / sparser, 2.0 = denser
+MUSIC_FILE = \"music.mp3\"         # put your own song next to this script (mp3 / ogg / wav). If missing,
+                                 # a soft built-in ambient track plays instead. Set to None for silence.
+MUSIC_VOLUME = 0.25
+SPIN = 0.07                      # spin speed (rad/s) - lower = slower
+PITCH = 2.7                      # how tightly the spiral arms wind
+SHARP = 7.0                      # brightness of the crisp full-resolution star points
+GAIN = 0.50                      # overall brightness
+INTRO = 9.0                      # seconds for the opening zoom-in (0 = skip it)
+DUST = 0.09                      # darkness of the dust lanes
+
+rng = np.random.default_rng(11)
+TAU = math.tau
+
+
+def q(n):
+    return int(n * QUALITY)
+
+
+# ----------------------------------------------------------------------------------------
+# Build the galaxy (all positions in galaxy units: disk radius = 1)
+# ----------------------------------------------------------------------------------------
+def build():
+    parts = []   # each: (R, theta, z, rgb_weight[N,3])
+
+    # --- spiral disk ---
+    n = q(150000)
+    r = rng.exponential(0.42, n)
+    r = r[r < 1.0]
+    n = len(r)
+    arm = rng.integers(0, 2, n)
+    in_arm = rng.random(n) < 0.80
+    th_arm = arm * math.pi + PITCH * np.log(r / 0.05 + 1.0) + rng.normal(0, 0.15 + 0.09 * r, n)   # tighter, crisper arms
+    th = np.where(in_arm, th_arm, rng.random(n) * TAU)
+    z = rng.normal(0, 0.010, n) * (1 + 2.0 * r)
+
+    warm = np.array([255, 214, 160], np.float32)
+    blue = np.array([160, 188, 255], np.float32)
+    mix = np.clip(r / 0.55, 0, 1) * np.where(in_arm, 1.0, 0.45)
+    col = warm[None] * (1 - mix[:, None]) + blue[None] * mix[:, None]
+    hii = in_arm & (rng.random(n) < 0.035) & (r > 0.25)          # pinkish star-forming knots
+    col[hii] = np.array([255, 130, 165], np.float32)
+    b = rng.uniform(0.25, 1.0, n) ** 2 * np.where(in_arm, 2.6, 1.0) * np.where(hii, 3.0, 1.0)
+    parts.append((r, th, z, col / 255.0 * (0.042 * b)[:, None]))
+
+    # --- star-forming clumps: glowing knots of pink gas and young blue-white stars strung along the arms ---
+    nc = q(340)
+    cr = 0.18 + 0.68 * rng.random(nc) ** 0.8
+    cth = (rng.integers(0, 2, nc) * math.pi + PITCH * np.log(cr / 0.05 + 1.0)
+           + rng.normal(0, 0.07, nc))
+    per = 70
+    k = nc * per
+    cx_ = np.repeat(cr * np.cos(cth), per) + rng.normal(0, 0.016, k)
+    cy_ = np.repeat(cr * np.sin(cth), per) + rng.normal(0, 0.016, k)
+    young = rng.random(k) < 0.42                                  # blue-white cluster stars vs pink gas
+    col = np.where(young[:, None], np.array([185, 205, 255], np.float32), np.array([255, 120, 170], np.float32))
+    cb = rng.uniform(0.3, 1.0, k) ** 2 * np.where(young, 0.12, 0.13)
+    parts.append((np.hypot(cx_, cy_), np.arctan2(cy_, cx_), rng.normal(0, 0.006, k), col / 255.0 * cb[:, None]))
+
+    # --- faint stellar bar through the middle, so the arms seem to grow out of it ---
+    n = q(15000)
+    bx, by = rng.normal(0, 0.15, n), rng.normal(0, 0.045, n)
+    ba = 0.6
+    x, y = bx * math.cos(ba) - by * math.sin(ba), bx * math.sin(ba) + by * math.cos(ba)
+    col = np.tile(np.array([255, 214, 160], np.float32) / 255.0, (n, 1))
+    parts.append((np.hypot(x, y), np.arctan2(y, x), rng.normal(0, 0.02, n),
+                  col * rng.uniform(0.03, 0.10, n)[:, None]))
+
+    # --- central bulge (a fat warm ball) ---
+    n = q(32000)
+    x, y = rng.normal(0, 0.085, (2, n))
+    zz = rng.normal(0, 0.060, n)
+    col = np.tile(np.array([255, 226, 180], np.float32) / 255.0, (n, 1))
+    parts.append((np.hypot(x, y), np.arctan2(y, x), zz, col * rng.uniform(0.03, 0.095, n)[:, None]))
+
+    # --- tiny bright nucleus ---
+    n = q(3500)
+    x, y = rng.normal(0, 0.025, (2, n))
+    zz = rng.normal(0, 0.02, n)
+    col = np.tile(np.array([255, 240, 215], np.float32) / 255.0, (n, 1))
+    parts.append((np.hypot(x, y), np.arctan2(y, x), zz, col * rng.uniform(0.08, 0.21, n)[:, None]))
+
+    # --- faint halo ---
+    n = q(7000)
+    p = rng.normal(0, 0.55, (3, n))
+    keep = np.linalg.norm(p, axis=0) < 1.3
+    p = p[:, keep]
+    col = np.tile(np.array([190, 200, 255], np.float32) / 255.0, (p.shape[1], 1))
+    parts.append((np.hypot(p[0], p[1]), np.arctan2(p[1], p[0]), p[2],
+                  col * rng.uniform(0.03, 0.10, p.shape[1])[:, None]))
+
+    R = np.concatenate([p[0] for p in parts]).astype(np.float32)
+    TH = np.concatenate([p[1] for p in parts]).astype(np.float32)
+    Z = np.concatenate([p[2] for p in parts]).astype(np.float32)
+    COL = np.concatenate([p[3] for p in parts]).astype(np.float32)
+
+    # --- dust lanes: hug the inner edge of each arm ---
+    n = q(34000)
+    dr = 0.07 + 0.70 * rng.random(n) ** 0.9
+    dth = (rng.integers(0, 2, n) * math.pi + PITCH * np.log(dr / 0.05 + 1.0)
+           - 0.20 + rng.normal(0, 0.09 + 0.06 * dr, n))
+    dz = rng.normal(0, 0.007, n)
+    dw = rng.uniform(0.4, 1.0, n) * (1.0 - 0.85 * dr)
+    return R, TH, Z, COL, dr.astype(np.float32), dth.astype(np.float32), dz.astype(np.float32), dw.astype(np.float32)
+
+
+R, TH, Z, COL, DR, DTH, DZ, DW = build()
+OM = (SPIN * (1.0 - 0.22 * np.minimum(R, 1.0))).astype(np.float32)      # slight differential spin
+DOM = (SPIN * (1.0 - 0.22 * np.minimum(DR, 1.0))).astype(np.float32)
+
+
+class View:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.tilt = 1.18      # 0 = face-on, pi/2 = edge-on
+        self.roll = -0.55     # in-screen rotation
+        self.zoom = 1.0
+        self.v_tilt = 0.0
+        self.v_roll = 0.0
+
+
+def box_blur(a, r):
+    \"\"\"Fast separable box blur on (H, W, ...) arrays using cumulative sums.\"\"\"
+    for axis in (0, 1):
+        n = a.shape[axis]
+        pad = [(0, 0)] * a.ndim
+        pad[axis] = (r + 1, r)
+        c = np.cumsum(np.pad(a, pad, mode=\"edge\"), axis=axis, dtype=np.float32)
+        hi = [slice(None)] * a.ndim
+        lo = [slice(None)] * a.ndim
+        hi[axis] = slice(2 * r + 1, 2 * r + 1 + n)
+        lo[axis] = slice(0, n)
+        a = (c[tuple(hi)] - c[tuple(lo)]) * np.float32(1.0 / (2 * r + 1))
+    return a
+
+
+def down(a, k):
+    h, w = a.shape[0] // k * k, a.shape[1] // k * k
+    out = a[0:h:k, 0:w:k].copy()
+    for i in range(k):
+        for j in range(k):
+            if i or j:
+                out += a[i:h:k, j:w:k]
+    return out * np.float32(1.0 / (k * k))
+
+
+_interp = {}
+
+
+def _axis_interp(n_in, n_out, k):
+    key = (n_in, n_out, k)
+    if key not in _interp:
+        pos = (np.arange(n_out) + 0.5) / k - 0.5
+        pos = np.clip(pos, 0, n_in - 1)
+        i0 = np.floor(pos).astype(np.int32)
+        i1 = np.minimum(i0 + 1, n_in - 1)
+        f = (pos - i0).astype(np.float32)
+        _interp[key] = (i0, i1, f)
+    return _interp[key]
+
+
+def up(a, k, shape):
+    \"\"\"Bilinear upsample (h, w, c) -> (shape[0], shape[1], c).\"\"\"
+    i0, i1, f = _axis_interp(a.shape[0], shape[0], k)
+    a = a[i0] * (1 - f)[:, None, None] + a[i1] * f[:, None, None]
+    j0, j1, g = _axis_interp(a.shape[1], shape[1], k)
+    return a[:, j0] * (1 - g)[None, :, None] + a[:, j1] * g[None, :, None]
+
+
+def splat(px, py, weights_list):
+    ix = px.astype(np.int32)
+    iy = py.astype(np.int32)
+    ok = (ix >= 0) & (ix < BW) & (iy >= 0) & (iy < BH)
+    idx = iy[ok] * BW + ix[ok]
+    return [np.bincount(idx, weights=w[ok], minlength=BW * BH).reshape(BH, BW).astype(np.float32)
+            for w in weights_list]
+
+
+def project(rad, ang, z, view):
+    \"\"\"Galaxy units -> full-resolution screen pixels.\"\"\"
+    x = rad * np.cos(ang)
+    y = rad * np.sin(ang)
+    ct, st = math.cos(view.tilt), math.sin(view.tilt)
+    y2 = y * ct - z * st
+    cr, sr = math.cos(view.roll), math.sin(view.roll)
+    sx = x * cr - y2 * sr
+    sy = x * sr + y2 * cr
+    k = R_PX * view.zoom
+    return W / 2 + sx * k, H / 2 + sy * k
+
+
+_sharp_buf = np.zeros((W, H, 3), np.uint8)
+SHARP_COL = None
+
+
+def render(view, t, lod=1, gain=GAIN):
+    \"\"\"Returns (glow, sharp): glow is a small uint8 (BW, BH, 3) image to be smooth-scaled up,
+    sharp is a full-size (W, H, 3) image of crisp star points to be added on top.\"\"\"
+    global SHARP_COL
+    if SHARP_COL is None:
+        SHARP_COL = np.clip(COL * 255.0 * SHARP, 0, 255).astype(np.uint8)
+    s = lod                       # level of detail: draw every s-th star (1 = all)
+    g = 2 * s                     # the soft glow layer uses every g-th star
+
+    fx, fy = project(R[::s], TH[::s] + OM[::s] * t, Z[::s], view)
+
+    # ---- soft glow layer (low resolution) ----
+    sub = slice(None, None, 2)
+    glow_w = [np.ascontiguousarray(COL[::g, c] * g) for c in range(3)]
+    chans = splat(fx[sub] * RS, fy[sub] * RS, glow_w)
+    img = np.stack(chans, axis=-1)
+
+    dx, dy = project(DR[::g], DTH[::g] + DOM[::g] * t, DZ[::g], view)
+    (dens,) = splat(dx * RS, dy * RS, [DW[::g] * g])
+    dens = box_blur(box_blur(dens[..., None], 1), 1)
+    atten = np.exp(-DUST * 2.2 * dens)
+    img = img * atten
+
+    glow = box_blur(box_blur(img, 2), 2)
+    glow2 = up(box_blur(box_blur(down(img, 2), 4), 4), 2, img.shape)
+    img = img + 0.9 * glow + 0.7 * glow2
+
+    out = 1.0 - np.exp(-img * gain)               # soft tone-mapping: bright core never hard-clips
+    glow_img = (out * 255).astype(np.uint8).transpose(1, 0, 2)
+
+    # ---- crisp stars: one pixel each at full resolution, dimmed where dust lies in front ----
+    ix = fx.astype(np.int32)
+    iy = fy.astype(np.int32)
+    ok = (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H)
+    ix, iy = ix[ok], iy[ok]
+    cx = np.clip((ix * RS).astype(np.int32), 0, BW - 1)
+    cy = np.clip((iy * RS).astype(np.int32), 0, BH - 1)
+    dim = atten[cy, cx, 0][:, None]
+    _sharp_buf.fill(0)
+    _sharp_buf[ix, iy] = (SHARP_COL[::s][ok] * dim).astype(np.uint8)
+    return glow_img, _sharp_buf
+
+
+# ----------------------------------------------------------------------------------------
+def make_starfield():
+    surf = pygame.Surface((W, H))
+    surf.fill((0, 0, 0))
+    r2 = np.random.default_rng(5)
+    for _ in range(650):
+        x, y = int(r2.integers(0, W)), int(r2.integers(0, H))
+        v = int(40 + 160 * r2.random() ** 3)
+        tint = r2.random()
+        c = (v, v, min(255, v + 40)) if tint < 0.5 else (min(255, v + 30), v, v - 10 if v > 10 else v)
+        surf.set_at((x, y), c)
+    for _ in range(26):                              # a few bright stars with a soft glow + cross
+        x, y = int(r2.integers(20, W - 20)), int(r2.integers(20, H - 20))
+        for rad, a in ((6, 18), (4, 40), (2, 110)):
+            pygame.draw.circle(surf, (a, a, a + 15), (x, y), rad)
+        pygame.draw.line(surf, (110, 110, 135), (x - 7, y), (x + 7, y))
+        pygame.draw.line(surf, (110, 110, 135), (x, y - 7), (x, y + 7))
+        surf.set_at((x, y), (255, 255, 255))
+    surf.blit(pygame.surfarray.make_surface(make_backdrop()), (0, 0), special_flags=pygame.BLEND_ADD)
+    return surf
+
+
+def _fbm(r2, h, w):
+    \"\"\"Soft cloudy noise in 0..1, shape (h, w, 1): four octaves of smoothly upscaled random grids.\"\"\"
+    f = np.zeros((h, w, 1), np.float32)
+    amps = (1.0, 0.5, 0.25, 0.12)
+    for k, a in zip((220, 110, 55, 28), amps):
+        g = r2.random((h // k + 2, w // k + 2, 1)).astype(np.float32)
+        f += a * up(g, k, (h, w))
+    return f / sum(amps)
+
+
+def make_backdrop():
+    \"\"\"Very faint violet / teal nebula clouds behind everything. Returns a (W, H, 3) uint8 array.\"\"\"
+    r2 = np.random.default_rng(21)
+    a = _fbm(r2, H, W)
+    b = _fbm(r2, H, W)
+    cloud = np.clip((a - 0.50) * 3.4, 0.0, 1.0) ** 2
+    t = np.clip((b - 0.35) * 3.0, 0.0, 1.0)
+    violet = np.array([115, 60, 175], np.float32)
+    teal = np.array([40, 115, 160], np.float32)
+    col = violet * (1 - t) + teal * t
+    return np.clip(col * cloud * 0.17, 0, 255).astype(np.uint8).transpose(1, 0, 2).copy()
+
+
+def make_vignette():
+    \"\"\"Gently darkens the corners. Returns a (W, H, 3) uint8 array for a BLEND_MULT blit.\"\"\"
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.hypot((xx - W / 2) / (W / 2), (yy - H / 2) / (H / 2))
+    v = 1.0 - 0.38 * np.clip(d - 0.45, 0.0, None) ** 1.6
+    v = (np.clip(v, 0.0, 1.0) * 255).astype(np.uint8)
+    return np.repeat(v.T[:, :, None], 3, axis=2).copy()
+
+
+def make_twinkles(n=130):
+    \"\"\"Extra background stars that slowly shimmer: (x, y, peak brightness, speed, phase, has_cross).\"\"\"
+    r3 = np.random.default_rng(8)
+    return [(int(r3.integers(0, W)), int(r3.integers(0, H)), int(70 + 150 * r3.random() ** 2),
+             0.6 + 2.4 * r3.random(), TAU * r3.random(), r3.random() < 0.12) for _ in range(n)]
+
+
+def draw_twinkles(screen, twinkles, now):
+    for x, y, v, sp, ph, cross in twinkles:
+        c = int(v * (0.35 + 0.65 * (0.5 + 0.5 * math.sin(sp * now + ph))))
+        screen.fill((c, c, min(255, c + 25)), (x, y, 1, 1), special_flags=pygame.BLEND_ADD)
+        if cross:
+            h = (c // 3, c // 3, min(255, c // 3 + 10))
+            screen.fill(h, (x - 2, y, 5, 1), special_flags=pygame.BLEND_ADD)
+            screen.fill(h, (x, y - 2, 1, 5), special_flags=pygame.BLEND_ADD)
+
+
+class ShootingStar:
+    \"\"\"A rare streak across the sky. Spawn one every so often and call draw() each frame.\"\"\"
+    LIFE = 0.9
+
+    def __init__(self):
+        side = 1 if random.random() < 0.5 else -1
+        self.x = random.uniform(0.1, 0.9) * W
+        self.y = random.uniform(0.02, 0.35) * H
+        ang = math.radians(random.uniform(18, 38))
+        self.dx, self.dy = side * math.cos(ang), math.sin(ang)
+        self.speed = random.uniform(850, 1200)
+        self.age = 0.0
+
+    @property
+    def alive(self):
+        return self.age < self.LIFE
+
+    def draw(self, screen, dt):
+        self.age += dt
+        fade = math.sin(math.pi * min(self.age / self.LIFE, 1.0))
+        hx = self.x + self.dx * self.speed * self.age
+        hy = self.y + self.dy * self.speed * self.age
+        length, seg = 150.0 * (0.4 + 0.6 * fade), 16
+        for i in range(seg):
+            f = 1.0 - i / seg
+            c = int(255 * f * f * fade)
+            if c < 4:
+                continue
+            p0 = (int(hx - self.dx * length * i / seg), int(hy - self.dy * length * i / seg))
+            p1 = (int(hx - self.dx * length * (i + 1) / seg), int(hy - self.dy * length * (i + 1) / seg))
+            pygame.draw.line(screen, (c, c, min(255, c + 30)), p0, p1, 2 if i < 6 else 1)
+
+
+# ----------------------------------------------------------------------------------------
+# \"YOU ARE HERE\" marker, pinned to a fixed spot in the disk  (elegant edition)
+# Drop-in replacement: delete the old block from the  YAH_R = ...  line down to the end of
+# `class YouAreHere`, and paste this in its place. Nothing else in the script needs to change.
+# ----------------------------------------------------------------------------------------
+YAH_R = 0.58                                                  # distance from the core (galaxy units)
+YAH_TH = PITCH * math.log(YAH_R / 0.05 + 1.0) + math.pi / 2   # halfway between the two arms
+YAH_OM = SPIN * (1.0 - 0.22 * YAH_R)                          # same differential spin as the stars there
+
+
+def _tracked(text, font, color, spacing):
+    \"\"\"Render text with extra letter-spacing (small-caps feel).\"\"\"
+    glyphs = [font.render(ch, True, color) for ch in text]
+    w = sum(g.get_width() for g in glyphs) + spacing * (len(glyphs) - 1)
+    surf = pygame.Surface((w, font.get_height()), pygame.SRCALPHA)
+    x = 0
+    for g in glyphs:
+        surf.blit(g, (x, 0))
+        x += g.get_width() + spacing
+    return surf
+
+
+def _glow_sprite(r):
+    \"\"\"Soft warm halo, drawn behind the marker.\"\"\"
+    yy, xx = np.mgrid[-r:r, -r:r].astype(np.float32)
+    d = np.hypot(xx + 0.5, yy + 0.5) / r
+    f = np.clip(1.0 - d, 0.0, 1.0) ** 2.2
+    surf = pygame.Surface((2 * r, 2 * r), pygame.SRCALPHA)
+    surf.fill((255, 236, 200, 0))
+    arr = pygame.surfarray.pixels_alpha(surf)
+    arr[:] = (f * 200).astype(np.uint8)
+    del arr
+    return surf
+
+
+def _draw_path(layer, pts, color, frac, width=1):
+    \"\"\"Draw a polyline, but only the first `frac` (0..1) of its length - used to \'write\' the line in.\"\"\"
+    segs = [(pts[i], pts[i + 1], math.dist(pts[i], pts[i + 1])) for i in range(len(pts) - 1)]
+    left = sum(s[2] for s in segs) * frac
+    for (x0, y0), (x1, y1), ln in segs:
+        if left <= 0:
+            break
+        k = min(1.0, left / ln) if ln > 0 else 1.0
+        pygame.draw.line(layer, color, (x0, y0), (x0 + (x1 - x0) * k, y0 + (y1 - y0) * k), width)
+        left -= ln
+
+
+class YouAreHere:
+    \"\"\"A quiet observatory-style annotation: a glowing point with a slow ripple and four hairline
+    ticks, a thin leader that draws itself in, and tracked small-caps text over an underline.\"\"\"
+    INK = (246, 238, 220)       # warm starlight white
+    DIM = (196, 188, 168)
+
+    def __init__(self):
+        serif = \"georgia,palatino,palatinolinotype,garamond,timesnewroman,dejavuserif\"
+        f_title = pygame.font.SysFont(serif, 15)
+        f_sub = pygame.font.SysFont(serif, 16, italic=True)
+        self.title = _tracked(\"YOU ARE HERE\", f_title, self.INK, 3)
+        self.title_sh = _tracked(\"YOU ARE HERE\", f_title, (0, 0, 0), 3)
+        self.sub = f_sub.render(\"probably\", True, self.DIM)
+        self.sub_sh = f_sub.render(\"probably\", True, (0, 0, 0))
+        self.glow = _glow_sprite(26)
+        self.layer = pygame.Surface((W, H), pygame.SRCALPHA)
+        self.alpha = 0.0
+
+    def draw(self, screen, view, t, now, show, dt):
+        self.alpha += ((1.0 if show else 0.0) - self.alpha) * min(1.0, dt * 2.2)
+        a = self.alpha
+        if a < 0.01:
+            return
+        e = a * a * (3.0 - 2.0 * a)                       # smoothstep ease
+
+        sx, sy = project(np.array([YAH_R], np.float32),
+                         np.array([YAH_TH + YAH_OM * t], np.float32),
+                         np.array([0.0], np.float32), view)
+        px, py = float(sx[0]), float(sy[0])
+        if not (-80 < px < W + 80 and -80 < py < H + 80):
+            return
+
+        ink = self.INK
+        layer = self.layer
+        layer.fill((0, 0, 0, 0))
+        R0 = 7
+
+        # soft breathing halo
+        pulse = 0.75 + 0.25 * math.sin(now * 2.0)
+        self.glow.set_alpha(int(210 * e * pulse))
+        screen.blit(self.glow, (int(px) - 26, int(py) - 26))
+
+        # core: thin ring + pin-prick centre
+        pygame.draw.circle(layer, (*ink, int(235 * e)), (int(px), int(py)), R0, 1)
+        pygame.draw.circle(layer, (*ink, int(255 * e)), (int(px), int(py)), 2)
+
+        # slow ripple that expands and dissolves
+        ph = (now * 0.45) % 1.0
+        pygame.draw.circle(layer, (*ink, int(150 * e * (1.0 - ph) ** 1.5)),
+                           (int(px), int(py)), int(R0 + 3 + 16 * ph), 1)
+
+        # four hairline ticks, slowly turning
+        for k in range(4):
+            ang = now * 0.25 + k * math.pi / 2
+            c, s = math.cos(ang), math.sin(ang)
+            pygame.draw.line(layer, (*ink, int(200 * e)),
+                             (px + c * (R0 + 4), py + s * (R0 + 4)),
+                             (px + c * (R0 + 9), py + s * (R0 + 9)), 1)
+
+        # label geometry: up-and-right by default, flips if it would leave the screen
+        tw, th = self.title.get_size()
+        bw = max(tw, self.sub.get_width())
+        pad = 7
+        line_len = bw + 2 * pad
+        dx = 1 if px + 36 + line_len < W - 10 else -1
+        dy = -1 if py - 36 - th - 8 > 10 else 1
+        k45 = 0.7071
+        P0 = (px + dx * (R0 + 11) * k45, py + dy * (R0 + 11) * k45)    # just outside the ticks
+        A = (px + dx * 36, py + dy * 36)                                # elbow
+        B = (A[0] + dx * line_len, A[1])                                # end of the underline
+        path = [P0, A, B]
+
+        # leader line \"writes itself in\" (with a faint dark under-stroke for contrast on bright stars)
+        shadow_path = [(x + 1, y + 1) for x, y in path]
+        _draw_path(layer, shadow_path, (0, 0, 0, int(110 * e)), e, 1)
+        _draw_path(layer, path, (*ink, int(215 * e)), e, 1)
+        pygame.draw.circle(layer, (*ink, int(255 * e)), (int(A[0]), int(A[1])), 2)
+
+        # text fades in once the line is mostly drawn
+        te = max(0.0, (e - 0.45) / 0.55)
+        ai = int(255 * te)
+        tx = A[0] + pad if dx == 1 else A[0] - pad - tw
+        sx_ = A[0] + pad if dx == 1 else A[0] - pad - self.sub.get_width()
+        ty = A[1] - th - 5
+        sy_ = A[1] + 5
+        for surf in (self.title, self.title_sh, self.sub, self.sub_sh):
+            surf.set_alpha(ai)
+        layer.blit(self.title_sh, (tx + 1, ty + 1))
+        layer.blit(self.title, (tx, ty))
+        layer.blit(self.sub_sh, (sx_ + 1, sy_ + 1))
+        layer.blit(self.sub, (sx_, sy_))
+
+        screen.blit(layer, (0, 0))
+
+
+# ----------------------------------------------------------------------------------------
+# Taurus: her constellation, pinned to the sky in the top-right corner
+# ----------------------------------------------------------------------------------------
+class Taurus:
+    \"\"\"Faint hairline constellation: horns, the Hyades V, glowing orange Aldebaran and the Pleiades.\"\"\"
+    BOX = (300, 230)
+    ORIGIN = (W - 290, 62)
+    PTS = {                      # local pixel coordinates inside the box
+        \"elnath\": (20, 30), \"zeta\": (28, 118), \"aldebaran\": (118, 98),
+        \"gamma\": (140, 86), \"delta\": (156, 70), \"epsilon\": (170, 60), \"pleiades\": (225, 28),
+    }
+    LINES = [(\"elnath\", \"aldebaran\"), (\"zeta\", \"aldebaran\"), (\"aldebaran\", \"gamma\"),
+             (\"gamma\", \"delta\"), (\"delta\", \"epsilon\"), (\"epsilon\", \"pleiades\")]
+    INK = (246, 238, 220)
+
+    def __init__(self):
+        r = np.random.default_rng(4)
+        px, py = self.PTS[\"pleiades\"]
+        self.cluster = [(px + r.normal(0, 6), py + r.normal(0, 5), r.uniform(0.5, 1.0),
+                         r.uniform(0.8, 2.2), r.uniform(0, TAU)) for _ in range(7)]
+        self.layer = pygame.Surface(self.BOX, pygame.SRCALPHA)
+        self.alpha = 0.0
+
+    def _star(self, layer, x, y, rad, color, a):
+        \"\"\"A small star with a soft falloff halo.\"\"\"
+        for k, (rr, aa) in enumerate(((rad * 4.0, 0.10), (rad * 2.6, 0.18), (rad * 1.6, 0.35))):
+            pygame.draw.circle(layer, (*color, int(255 * aa * a)), (int(x), int(y)), max(1, int(rr)))
+        pygame.draw.circle(layer, (*color, int(255 * a)), (int(x), int(y)), max(1, int(rad)))
+
+    def draw(self, screen, now, show, dt):
+        self.alpha += ((1.0 if show else 0.0) - self.alpha) * min(1.0, dt * 1.6)
+        a = self.alpha
+        if a < 0.01:
+            return
+        e = a * a * (3.0 - 2.0 * a)
+        layer = self.layer
+        layer.fill((0, 0, 0, 0))
+        P = self.PTS
+
+        # constellation lines, hairline and dim
+        for u, v in self.LINES:
+            pygame.draw.line(layer, (*self.INK, int(70 * e)), P[u], P[v], 1)
+
+        # stars (each twinkles on its own slow rhythm)
+        def tw(sp, ph):
+            return 0.78 + 0.22 * math.sin(now * sp + ph)
+        self._star(layer, *P[\"aldebaran\"], 3.4, (255, 176, 118), e * tw(1.3, 0.4))
+        for name, rad, sp, ph in ((\"elnath\", 2.4, 1.7, 1.0), (\"zeta\", 2.0, 1.1, 2.1), (\"gamma\", 2.0, 1.9, 3.0),
+                                  (\"delta\", 1.8, 1.5, 4.0), (\"epsilon\", 2.0, 1.2, 5.0)):\
+            self._star(layer, *P[name], rad, (232, 236, 255), e * tw(sp, ph))
+        for x, y, b, sp, ph in self.cluster:                       # the Pleiades
+            self._star(layer, x, y, 1.0 + 0.6 * b, (190, 210, 255), e * b * tw(sp, ph))
+
+        screen.blit(layer, self.ORIGIN)
+
+
+# ----------------------------------------------------------------------------------------
+# Music
+# ----------------------------------------------------------------------------------------
+def make_ambient(seconds_per_chord=7.0, sr=44100):
+    \"\"\"A soft, slowly shifting pad with a few gentle bell notes. Seamlessly loopable.\"\"\"
+    chords = [                      # Am9 -> Fmaj7 -> Cmaj9 -> G6   (MIDI notes)
+        [45, 52, 57, 60, 64, 71],
+        [41, 48, 57, 60, 64, 69],
+        [48, 52, 55, 62, 64, 71],
+        [43, 50, 55, 59, 64, 69],
+    ]
+    D = seconds_per_chord
+    T = D * len(chords)
+    n = int(T * sr)
+    t = np.arange(n) / sr
+    out = np.zeros((n, 2), np.float64)
+    hz = lambda m: 440.0 * 2 ** ((m - 69) / 12.0)
+
+    for i, chord in enumerate(chords):
+        c = (i + 0.5) * D
+        dist = np.abs(t - c)
+        dist = np.minimum(dist, T - dist)                       # circular distance -> loops cleanly
+        env = np.cos(np.clip(dist / (D * 0.95), 0, 1) * math.pi / 2) ** 2
+        for k, m in enumerate(chord):
+            f = round(hz(m) * T) / T                            # whole cycles per loop -> no click at the seam
+            pan = 0.25 + 0.5 * ((k * 0.37 + i * 0.19) % 1.0)
+            r1 = round((0.07 + 0.02 * k) * T) / T
+            r2 = round(0.11 * T) / T
+            wob = 0.9 * np.sin(2 * math.pi * r1 * t + k)           # gentle shimmer (periodic)
+            tone = np.sin(2 * math.pi * f * t + wob) + 0.28 * np.sin(2 * math.pi * 2 * f * t) \\
+                + 0.10 * np.sin(2 * math.pi * 3 * f * t)
+            tone *= env * (0.55 if m < 55 else 0.32) * (0.85 + 0.15 * np.sin(2 * math.pi * r2 * t + k))
+            out[:, 0] += tone * (1 - pan)
+            out[:, 1] += tone * pan
+
+    # sparse bell notes (pentatonic), wrapped around the loop point
+    r = np.random.default_rng(3)
+    scale = [69, 72, 74, 76, 79, 81, 84]
+    for b in range(int(T / 2.6)):
+        start = b * 2.6 + r.uniform(0, 1.2)
+        f = hz(scale[int(r.integers(0, len(scale)))])
+        tt = (np.arange(int(4.5 * sr)) / sr)
+        bell = np.sin(2 * math.pi * f * tt) * np.exp(-tt * 1.15) * (1 - np.exp(-tt * 90))
+        bell += 0.3 * np.sin(2 * math.pi * 2.01 * f * tt) * np.exp(-tt * 2.4)
+        idx = (int(start * sr) + np.arange(len(tt))) % n
+        pan = r.uniform(0.2, 0.8)
+        np.add.at(out[:, 0], idx, bell * 0.10 * (1 - pan))
+        np.add.at(out[:, 1], idx, bell * 0.10 * pan)
+
+    out /= np.max(np.abs(out)) * 1.15
+    return (out * 32767).astype(np.int16)
+
+
+def start_music():
+    \"\"\"Starts looping music. Returns a function to mute/unmute, or None if audio isn\'t available.
+    Tries your own file first (also music.ogg / music.wav / music.mp3 next to the script);
+    if none of them can be decoded it falls back to the built-in ambient track.\"\"\"
+    if MUSIC_FILE is None:
+        return None
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init(44100, -16, 2, 1024)
+    except Exception as err:            # no sound card - keep the visuals running
+        print(\"music disabled:\", err)
+        return None
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.splitext(MUSIC_FILE)[0]
+    names = [MUSIC_FILE] + [base + ext for ext in (\".ogg\", \".wav\", \".mp3\")]
+    for name in dict.fromkeys(names):
+        path = os.path.join(here, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.set_volume(MUSIC_VOLUME)
+            pygame.mixer.music.play(-1, fade_ms=8000)
+        except Exception as err:
+            print(f\"couldn\'t play {name} ({err}). Convert it to .ogg or .wav and try again.\")
+            continue
+        state = {\"muted\": False}
+
+        def toggle():
+            state[\"muted\"] = not state[\"muted\"]
+            pygame.mixer.music.set_volume(0.0 if state[\"muted\"] else MUSIC_VOLUME)
+        return toggle
+
+    try:                                 # nothing usable found: built-in ambient pad
+        sound = pygame.sndarray.make_sound(make_ambient())
+        sound.set_volume(MUSIC_VOLUME)
+        sound.play(loops=-1, fade_ms=8000)
+    except Exception as err:
+        print(\"music disabled:\", err)
+        return None
+    state = {\"muted\": False}
+
+    def toggle():
+        state[\"muted\"] = not state[\"muted\"]
+        sound.set_volume(0.0 if state[\"muted\"] else MUSIC_VOLUME)
+    return toggle
+
+
+POEM = [
+    \"I’m still learning her\",
+    \"the way you learn a sky:\",
+    \"not all at once,\",
+    \"but one quiet night at a time,\",
+    \"until the dark\",
+    \"stops feeling strange\",
+    \"and starts feeling like home.\",
+
+]
+TEXT_COLOR = (228, 228, 70)
+TEXT_SIZE = 30
+
+
+def make_text():
+    font = pygame.font.SysFont(\"verdana,dejavusans,trebuchetms,arial\", TEXT_SIZE)
+    lh = int(font.get_linesize() * 1.15)
+    surf = pygame.Surface((W, lh * len(POEM) + 12), pygame.SRCALPHA)
+    for i, line in enumerate(POEM):
+        shadow = font.render(line, True, (0, 0, 0))
+        main_ = font.render(line, True, TEXT_COLOR)
+        for ox, oy in ((2, 2), (-1, 2), (2, -1)):\
+            surf.blit(shadow, (50 + ox, 6 + i * lh + oy))
+        surf.blit(main_, (50, 6 + i * lh))
+    return surf
+
+
+def intro_view(view, p):
+    \"\"\"Opening shot: the galaxy starts as a tiny far-away spark, face-on-ish and spinning,
+    then glides in, tilting and turning into its resting pose. p goes 0 -> 1.\"\"\"
+    e = 1.0 - (1.0 - p) ** 3.2                       # ease-out: fast at first, settles gently
+    z0, z1 = 0.035, 1.0
+    view.zoom = math.exp(math.log(z0) + (math.log(z1) - math.log(z0)) * e)
+    view.tilt = 0.30 + (1.18 - 0.30) * e
+    view.roll = -2.4 + (-0.55 + 2.4) * e
+    return e
+
+
+def main():
+    pygame.mixer.pre_init(44100, -16, 2, 1024)
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption(\"Milky Way - drag to grab, scroll to zoom\")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont(None, 22)
+
+    toggle_music = start_music()
+    text = make_text()
+    show_text = True
+    text_alpha = 0.0
+    yah = YouAreHere()
+    show_yah = True
+    taurus = Taurus()
+    show_taurus = True
+    lod = 1
+    avg_ms = 16.0
+    cooldown = 0
+    small = pygame.Surface((BW, BH))
+    sharp = pygame.Surface((W, H))
+    stars = make_starfield()
+    twinkles = make_twinkles()
+    vignette = pygame.surfarray.make_surface(make_vignette())
+    shooters = []
+    next_shoot = 9.0                 # seconds of wall-clock time until the next shooting star
+    clock_t = 0.0
+    view = View()
+    blackout = pygame.Surface((W, H))
+    blackout.fill((0, 0, 0))
+    intro_t = 0.0 if INTRO > 0 else 1e9
+    ease = 0.0
+
+    dragging = False
+    paused = False
+    t = 0.0
+    frame = 0
+    running = True
+
+    while running:
+        dt = min(clock.tick(60) / 1000.0, 0.05)
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                elif e.key == pygame.K_SPACE:
+                    paused = not paused
+                elif e.key == pygame.K_r:
+                    view.reset()
+                elif e.key == pygame.K_t:
+                    show_text = not show_text
+                elif e.key == pygame.K_y:
+                    show_yah = not show_yah
+                elif e.key == pygame.K_z:
+                    show_taurus = not show_taurus
+                elif e.key == pygame.K_m and toggle_music:
+                    toggle_music()
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                if intro_t < INTRO:                 # touching skips the opening shot
+                    view.reset()
+                    ease = 1.0
+                intro_t = max(intro_t, INTRO)
+                dragging = True
+                view.v_tilt = view.v_roll = 0.0
+                pygame.mouse.get_rel()
+                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_SIZEALL)
+            elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
+                dragging = False
+                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
+            elif e.type == pygame.MOUSEWHEEL:
+                if intro_t < INTRO:
+                    view.reset()
+                    ease = 1.0
+                intro_t = max(intro_t, INTRO)
+                view.zoom = float(np.clip(view.zoom * (1.1 ** e.y), 0.4, 3.0))
+
+        intro_on = intro_t < INTRO
+        if intro_on:
+            intro_t += dt
+            if intro_t >= INTRO:
+                view.reset()
+                ease = 1.0
+            else:
+                ease = intro_view(view, intro_t / INTRO)
+                view.v_tilt = view.v_roll = 0.0
+
+        if dragging and not intro_on:
+            dx, dy = pygame.mouse.get_rel()
+            view.v_roll = dx * 0.006 / max(dt, 1e-3) * 0.25
+            view.v_tilt = dy * 0.006 / max(dt, 1e-3) * 0.25
+            view.roll += dx * 0.006
+            view.tilt += dy * 0.006
+        elif not intro_on:
+            view.roll += view.v_roll * dt
+            view.tilt += view.v_tilt * dt
+            damp = math.exp(-3.0 * dt)
+            view.v_roll *= damp
+            view.v_tilt *= damp
+
+        view.tilt = float(np.clip(view.tilt, -math.pi / 2 + 0.02, math.pi / 2 - 0.02))
+
+        if not paused:
+            t += dt * (1.0 + 7.0 * (1.0 - ease) ** 2 if intro_on else 1.0)   # spins faster while far away
+
+        gain = GAIN * min(1.0, view.zoom ** 1.1)          # keep a tiny, far-away galaxy from blowing out
+        glow_img, sharp_img = render(view, t, lod, gain)
+        pygame.surfarray.blit_array(small, glow_img)
+        pygame.surfarray.blit_array(sharp, sharp_img)
+        pygame.transform.smoothscale(small, (W, H), screen)
+        screen.blit(sharp, (0, 0), special_flags=pygame.BLEND_ADD)
+        screen.blit(stars, (0, 0), special_flags=pygame.BLEND_ADD)
+
+        # shimmering stars, and a rare shooting star once the opening shot is over
+        clock_t += dt
+        draw_twinkles(screen, twinkles, clock_t)
+        if not intro_on:
+            next_shoot -= dt
+            if next_shoot <= 0:
+                shooters.append(ShootingStar())
+                next_shoot = random.uniform(7.0, 16.0)
+        for s in shooters:
+            s.draw(screen, dt)
+        shooters = [s for s in shooters if s.alive]
+
+        screen.blit(vignette, (0, 0), special_flags=pygame.BLEND_MULT)      # darken the corners
+
+        # \"YOU ARE HERE\" (drawn after the vignette so it stays bright)
+        yah.draw(screen, view, t, clock_t, show_yah and not intro_on, dt)
+        taurus.draw(screen, clock_t, show_taurus and not intro_on, dt)
+
+        # fade up from black at the very start
+        if intro_on and intro_t < 3.0:
+            blackout.set_alpha(int(255 * (1.0 - intro_t / 3.0) ** 1.5))
+            screen.blit(blackout, (0, 0))
+
+        # text fades in / out smoothly (after the opening shot has settled)
+        if not intro_on:
+            text_alpha += ((1.0 if show_text else 0.0) - text_alpha) * min(1.0, dt * 2.5)
+        if text_alpha > 0.01:
+            text.set_alpha(int(255 * text_alpha))
+            screen.blit(text, (0, int(H * 0.36)))
+
+        # adaptive detail: keep the frame rate smooth on slower computers
+        avg_ms = avg_ms * 0.93 + dt * 1000 * 0.07
+        cooldown -= 1
+        if cooldown <= 0:
+            if avg_ms > 24 and lod < 4:
+                lod += 1
+                cooldown = 45
+            elif avg_ms < 12 and lod > 1:
+                lod -= 1
+                cooldown = 90
+
+        pygame.display.flip()
+        frame += 1
+
+    pygame.quit()
+
+
+if __name__ == \"__main__\":
+    main()
+
+</code></pre>
+</body>
+</html>
